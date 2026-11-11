@@ -1,4 +1,5 @@
-/* Vistas: Inicio, Canchas, Detalle de cancha, Mis partidas y Perfil. */
+/* Vistas: Inicio, Canchas, Detalle de cancha, Mis partidas y Perfil (ingreso / registro / edición).
+   Cada vista es una función async que devuelve un nodo; el router espera el resultado. */
 (function (MF) {
   'use strict';
 
@@ -9,23 +10,31 @@
 
   const go = (hash) => { location.hash = hash; };
   const refresh = () => MF.App.render();
+  /** Navega a un hash; si ya estamos ahí, solo refresca. */
+  const irA = (hash) => { if (location.hash === hash) refresh(); else go(hash); };
   const titulo = (nodo, t) => { nodo.dataset.title = t; return nodo; };
 
-  /** Ejecuta una acción del servicio y muestra el resultado. */
-  function accion(resultado, okMsg) {
-    if (resultado.ok) {
+  /** Ejecuta una acción del servicio (promesa de { ok, error }) y muestra el resultado. */
+  async function accion(promesa, okMsg) {
+    const r = await promesa;
+    if (r.ok) {
       if (okMsg) toast(okMsg);
       refresh();
     } else {
-      toast(resultado.error, 'bad');
+      toast(r.error, 'bad');
     }
-    return resultado.ok;
+    return r.ok;
   }
+
+  /** Envuelve un manejador async para que un fallo se muestre como aviso en vez de perderse. */
+  const seguro = (fn) => async (...args) => {
+    try { return await fn(...args); } catch (e) { toast(e.message, 'bad'); }
+  };
 
   function requierePerfil() {
     const a = Svc.getActivo();
     if (!a) {
-      toast('Primero crea o selecciona un perfil de jugador.', 'bad');
+      toast('Primero inicia sesión o crea tu perfil de jugador.', 'bad');
       go('#/perfil');
     }
     return a;
@@ -41,6 +50,11 @@
 
   V.notFound = (msg) =>
     titulo(h('section', { class: 'page' }, vacio(msg, 'La dirección no existe o ya no está disponible.', h('a', { class: 'btn', href: '#/' }, 'Ir al inicio'))), 'No encontrado');
+
+  V.error = (msg, reintentar) =>
+    titulo(h('section', { class: 'page' },
+      vacio('No pudimos cargar la información', msg || 'Ocurrió un error inesperado.',
+        h('button', { type: 'button', class: 'btn btn--primary', onclick: reintentar || refresh }, 'Reintentar'))), 'Error');
 
   /* ----------------------------------------------------- Filtros de búsqueda */
 
@@ -74,9 +88,7 @@
       const fd = new FormData(form);
       const p = new URLSearchParams();
       ['ciudad', 'localidad', 'fecha', 'tipo', 'orden'].forEach((k) => { if (fd.get(k)) p.set(k, fd.get(k)); });
-      const destino = `#/canchas${p.toString() ? `?${p.toString()}` : ''}`;
-      if (location.hash === destino) refresh();
-      else go(destino);
+      irA(`#/canchas${p.toString() ? `?${p.toString()}` : ''}`);
     });
     return form;
   }
@@ -91,7 +103,7 @@
     else if (rel) cta = badge(rel.solicitud.estado);
     else cta = h('button', {
       type: 'button', class: 'btn btn--small btn--primary',
-      onclick: () => { const a = requierePerfil(); if (a) accion(Svc.solicitarUnirse(p.id_reserva, a.id_jugador), 'Solicitud enviada al organizador.'); },
+      onclick: () => { if (requierePerfil()) accion(Svc.solicitarUnirse(p.id_reserva), 'Solicitud enviada al organizador.'); },
     }, 'Solicitar unirme');
 
     return h('article', { class: 'card card--match' },
@@ -108,11 +120,21 @@
 
   /* ------------------------------------------------------------------ Inicio */
 
-  V.home = function () {
+  V.home = async function () {
     const activo = Svc.getActivo();
     const loc = activo ? Svc.getLocalidad(activo.id_localidad) : null;
     const valores = loc ? { ciudad: loc.id_ciudad, localidad: loc.id_localidad } : {};
-    const partidas = Svc.partidasAbiertas({ id_localidad: loc ? loc.id_localidad : null, limit: 9 });
+    // Las partidas solo las ve quien tiene sesión (RLS).
+    const partidas = activo ? await Svc.partidasAbiertas({ id_localidad: loc ? loc.id_localidad : null, limit: 9 }) : [];
+
+    let abiertas;
+    if (!activo) {
+      abiertas = vacio('Ingresa para ver las partidas abiertas', 'Crea tu perfil o inicia sesión para ver las partidas con cupos y unirte.', h('a', { class: 'btn btn--primary', href: '#/perfil' }, 'Ingresar o crear perfil'));
+    } else if (partidas.length) {
+      abiertas = h('div', { class: 'grid' }, partidas.map((p) => partidaCard(p, activo)));
+    } else {
+      abiertas = vacio('No hay partidas abiertas por ahora', loc ? `Todavía no hay partidas con cupos en ${loc.nombre}. Reserva una cancha y crea la tuya.` : 'Reserva una cancha y crea la primera partida.', h('a', { class: 'btn btn--primary', href: '#/canchas' }, 'Ver canchas'));
+    }
 
     return titulo(h('div', null,
       h('section', { class: 'hero' },
@@ -123,10 +145,8 @@
       h('section', { class: 'page' },
         h('div', { class: 'section-head' },
           h('h2', null, loc ? `Partidas con cupos abiertos en ${loc.nombre}` : 'Partidas con cupos abiertos'),
-          !activo && h('a', { class: 'link', href: '#/perfil' }, 'Crea tu perfil para unirte')),
-        partidas.length
-          ? h('div', { class: 'grid' }, partidas.map((p) => partidaCard(p, activo)))
-          : vacio('No hay partidas abiertas por ahora', loc ? `Todavía no hay partidas con cupos en ${loc.nombre}. Reserva una cancha y crea la tuya.` : 'Reserva una cancha y crea la primera partida.', h('a', { class: 'btn btn--primary', href: '#/canchas' }, 'Ver canchas'))),
+          !activo && h('a', { class: 'link', href: '#/perfil' }, 'Ingresa para unirte')),
+        abiertas),
 
       h('section', { class: 'page steps' },
         h('h2', null, 'Cómo funciona'),
@@ -139,7 +159,7 @@
 
   /* ----------------------------------------------------------------- Canchas */
 
-  V.canchas = function (_, q) {
+  V.canchas = async function (_, q) {
     const valores = {
       ciudad: q.get('ciudad') || '',
       localidad: q.get('localidad') || '',
@@ -147,7 +167,7 @@
       tipo: q.get('tipo') || '',
       orden: q.get('orden') || '',
     };
-    const lista = Svc.buscarCanchas({
+    const lista = await Svc.buscarCanchas({
       id_ciudad: Number(valores.ciudad) || null,
       id_localidad: Number(valores.localidad) || null,
       fecha: valores.fecha || null,
@@ -181,7 +201,7 @@
 
   /* -------------------------------------------------------- Detalle de cancha */
 
-  V.cancha = function (params, q) {
+  V.cancha = async function (params, q) {
     const cancha = Svc.getCancha(Number(params[0]));
     if (!cancha) return V.notFound('Cancha no encontrada');
     const activo = Svc.getActivo();
@@ -189,8 +209,9 @@
     const ciudad = Svc.getCiudad(loc.id_ciudad);
     const fechas = Svc.fechasDisponibles();
     const fecha = fechas.includes(q.get('fecha')) ? q.get('fecha') : fechas[0];
-    const horarios = Svc.horariosDe(cancha.id_cancha, fecha);
+    const horarios = await Svc.horariosDe(cancha.id_cancha, fecha);
     const sel = horarios.find((x) => x.id_horario === Number(q.get('horario'))) || null;
+    const panel = await panelHorario(cancha, sel, activo);
 
     const chips = h('nav', { class: 'chips', 'aria-label': 'Fecha' },
       fechas.map((f) => h('a', { class: 'chip-date', href: linkCancha(cancha.id_cancha, f), 'aria-current': f === fecha ? 'date' : null }, D.fmtCorto(f))));
@@ -217,18 +238,18 @@
         h('div', { class: 'detail-meta' }, h('span', { class: 'tag' }, `${cancha.tipo_cancha} · ${Svc.TIPOS[cancha.tipo_cancha].label}`), h('span', { class: 'price' }, D.fmtCOP(cancha.precio_hora), h('span', null, ' / hora')))),
       h('div', { class: 'detail' },
         h('div', { class: 'detail__main' }, h('h2', null, 'Horarios'), chips, slots),
-        h('aside', { class: 'detail__side', 'aria-live': 'polite' }, panelHorario(cancha, sel, activo)))
+        h('aside', { class: 'detail__side', 'aria-live': 'polite' }, panel))
     ), cancha.nombre);
   };
 
-  function panelHorario(cancha, sel, activo) {
+  async function panelHorario(cancha, sel, activo) {
     if (!sel) return h('div', { class: 'panel' }, h('h2', null, 'Reserva y equipo'), h('p', { class: 'muted' }, 'Selecciona un horario para reservarlo, solicitar unirte o ver los jugadores disponibles.'));
     const cab = h('div', { class: 'panel__head' }, h('h2', null, `${D.fmtCorto(sel.fecha)} · ${horaRango(sel)}`), badge(sel.estado));
 
     if (sel.estado === 'FINALIZADO') return h('div', { class: 'panel' }, cab, h('p', { class: 'muted' }, 'Esta franja ya pasó y no se puede reservar.'));
 
     if (sel.estado === 'DISPONIBLE') {
-      return h('div', { class: 'panel' }, cab, formReserva(cancha, sel, activo), listaJugadores(sel, null, activo));
+      return h('div', { class: 'panel' }, cab, formReserva(cancha, sel, activo), await listaJugadores(sel, null, activo));
     }
 
     const r = sel.reserva;
@@ -240,14 +261,14 @@
     if (esOrg) {
       cta = h('button', {
         type: 'button', class: 'btn btn--danger',
-        onclick: () => { if (window.confirm('¿Cancelar esta reserva? Se liberará la franja y se cancelarán las solicitudes pendientes.')) accion(Svc.cancelarReserva(r.id_reserva, activo.id_jugador), 'Reserva cancelada.'); },
+        onclick: () => { if (window.confirm('¿Cancelar esta reserva? Se liberará la franja y se cancelarán las solicitudes pendientes.')) accion(Svc.cancelarReserva(r.id_reserva), 'Reserva cancelada.'); },
       }, 'Cancelar reserva');
     } else if (rel) {
       cta = h('p', null, 'Tu solicitud: ', badge(rel.solicitud.estado));
     } else if (r.cuposLibres > 0) {
       cta = h('button', {
         type: 'button', class: 'btn btn--primary',
-        onclick: () => { const a = requierePerfil(); if (a) accion(Svc.solicitarUnirse(r.id_reserva, a.id_jugador), 'Solicitud enviada al organizador.'); },
+        onclick: () => { if (requierePerfil()) accion(Svc.solicitarUnirse(r.id_reserva), 'Solicitud enviada al organizador.'); },
       }, 'Solicitar unirme');
     } else {
       cta = h('p', { class: 'muted' }, 'La partida no tiene cupos disponibles.');
@@ -258,35 +279,45 @@
       h('p', null, h('strong', null, 'Cupos: '), `${r.cupos_ocupados} de ${r.cupos_totales} ocupados`),
       h('p', { class: 'small muted' }, 'Jugadores: ', [r.organizador].concat(r.participantes).filter(Boolean).map((j) => j.nombre).join(', ')),
       cta,
-      listaJugadores(sel, r, activo));
+      await listaJugadores(sel, r, activo));
   }
 
   function formReserva(cancha, sel, activo) {
     if (!activo) {
-      return h('div', { class: 'note' }, h('p', null, 'Necesitas un perfil de jugador para reservar.'), h('a', { class: 'btn btn--primary', href: '#/perfil' }, 'Crear o elegir perfil'));
+      return h('div', { class: 'note' }, h('p', null, 'Necesitas iniciar sesión para reservar.'), h('a', { class: 'btn btn--primary', href: '#/perfil' }, 'Ingresar o crear perfil'));
     }
     const max = Svc.TIPOS[cancha.tipo_cancha].cupos;
     const cupos = h('input', { type: 'number', id: 'r-cupos', min: 2, max, value: max, inputmode: 'numeric', required: true });
     const pos = select({ id: 'r-pos' }, Svc.POSICIONES.map((p) => ({ value: p, label: POSICION_LABEL[p] })), activo.posicion_preferida);
     const err = h('p', { class: 'error', id: 'r-err', role: 'alert' });
+    const btn = h('button', { type: 'submit', class: 'btn btn--primary btn--block' }, `Confirmar reserva · ${D.fmtCOP(cancha.precio_hora)}`);
     const form = h('form', { class: 'form', novalidate: true },
       h('div', { class: 'field' }, h('label', { for: 'r-cupos' }, `Cupos totales de la partida (2 a ${max})`), cupos),
       h('div', { class: 'field' }, h('label', { for: 'r-pos' }, 'Tu posición en la partida'), pos),
-      err,
-      h('button', { type: 'submit', class: 'btn btn--primary btn--block' }, `Confirmar reserva · ${D.fmtCOP(cancha.precio_hora)}`));
-    form.addEventListener('submit', (e) => {
+      err, btn);
+    form.addEventListener('submit', async (e) => {
       e.preventDefault();
       err.textContent = '';
-      const res = Svc.reservar({ id_horario: sel.id_horario, id_organizador: activo.id_jugador, cupos_totales: Number(cupos.value), posicion: pos.value });
+      btn.disabled = true;
+      const res = await Svc.reservar({ id_horario: sel.id_horario, cupos_totales: Number(cupos.value), posicion: pos.value });
+      btn.disabled = false;
       if (res.ok) { toast('¡Reserva confirmada! Ahora puedes invitar jugadores.'); refresh(); }
       else { err.textContent = res.error; cupos.focus(); }
     });
     return form;
   }
 
-  function listaJugadores(sel, reserva, activo) {
-    const jugadores = Svc.jugadoresDisponibles(sel.id_horario);
-    const esOrg = reserva && activo && reserva.id_organizador === activo.id_jugador;
+  async function listaJugadores(sel, reserva, activo) {
+    let jugadores;
+    try {
+      jugadores = await Svc.jugadoresDisponibles(sel, reserva, activo && activo.id_jugador);
+    } catch (e) {
+      return h('div', { class: 'players' }, h('h3', null, 'Jugadores disponibles'), h('p', { class: 'error' }, e.message));
+    }
+    if (!activo) {
+      return h('div', { class: 'players' }, h('h3', null, 'Jugadores disponibles'), h('p', { class: 'muted' }, 'Inicia sesión para ver quién está disponible en esta localidad.'));
+    }
+    const esOrg = reserva && reserva.id_organizador === activo.id_jugador;
     return h('div', { class: 'players' },
       h('h3', null, `Jugadores disponibles (${jugadores.length})`),
       !reserva && jugadores.length > 0 && h('p', { class: 'muted small' }, 'Reserva la franja para poder invitarlos.'),
@@ -296,7 +327,7 @@
             let accion_;
             if (s) accion_ = badge(s.estado);
             else if (esOrg && reserva.cuposLibres > 0) {
-              accion_ = h('button', { type: 'button', class: 'btn btn--small btn--primary', onclick: () => accion(Svc.invitar(reserva.id_reserva, activo.id_jugador, j.id_jugador), `Invitación enviada a ${j.nombre}.`) }, 'Invitar');
+              accion_ = h('button', { type: 'button', class: 'btn btn--small btn--primary', onclick: () => accion(Svc.invitar(reserva.id_reserva, j.id_jugador), `Invitación enviada a ${j.nombre}.`) }, 'Invitar');
             }
             return h('li', { class: 'list__item' },
               avatar(j.nombre),
@@ -308,10 +339,10 @@
         : h('p', { class: 'muted' }, 'Nadie con disponibilidad en esta localidad para esa franja.'));
   }
 
-  function verJugador(j) {
+  const verJugador = seguro(async function (j) {
     const loc = Svc.getLocalidad(j.id_localidad);
     const ciudad = Svc.getCiudad(loc.id_ciudad);
-    const disp = Svc.disponibilidadDe(j.id_jugador);
+    const disp = await Svc.disponibilidadDe(j.id_jugador);
     const activo = Svc.getActivo();
     openDialog(j.nombre, h('div', { class: 'profile-view' },
       h('div', { class: 'profile-view__top' }, avatar(j.nombre), h('div', null, h('p', null, h('strong', null, POSICION_LABEL[j.posicion_preferida])), h('p', { class: 'muted' }, `${loc.nombre}, ${ciudad.nombre}`))),
@@ -319,19 +350,19 @@
       h('ul', { class: 'plain' }, disp.map((d) => h('li', null, h('strong', null, D.DIAS[d.dia_semana - 1]), ` ${d.hora_inicio} – ${d.hora_fin}`))),
       j.telefono && activo && activo.id_jugador !== j.id_jugador &&
         h('a', { class: 'btn btn--primary', href: waLink(j.telefono, `Hola ${j.nombre.split(' ')[0]}, te escribo desde MatchField para invitarte a una partida.`), target: '_blank', rel: 'noopener noreferrer' }, 'Contactar por WhatsApp')));
-  }
+  });
 
   /* ------------------------------------------------------------ Mis partidas */
 
   const TABS = [['reservas', 'Mis reservas'], ['responder', 'Por responder'], ['enviadas', 'Enviadas']];
 
-  V['mis-partidas'] = function (_, q) {
+  V['mis-partidas'] = async function (_, q) {
     const activo = Svc.getActivo();
     if (!activo) {
       return titulo(h('section', { class: 'page' }, h('h1', null, 'Mis partidas'),
-        vacio('Aún no tienes un perfil activo', 'Crea o selecciona un perfil para ver tus reservas, solicitudes e invitaciones.', h('a', { class: 'btn btn--primary', href: '#/perfil' }, 'Ir a Perfil'))), 'Mis partidas');
+        vacio('Aún no has iniciado sesión', 'Ingresa o crea tu perfil para ver tus reservas, solicitudes e invitaciones.', h('a', { class: 'btn btn--primary', href: '#/perfil' }, 'Ingresar o crear perfil'))), 'Mis partidas');
     }
-    const data = Svc.misPartidas(activo.id_jugador);
+    const data = await Svc.misPartidas(activo.id_jugador);
     const tab = TABS.some((t) => t[0] === q.get('tab')) ? q.get('tab') : 'reservas';
     const conteo = { reservas: data.mias.length + data.jugando.length, responder: data.pendientes, enviadas: data.enviadasPendientes };
 
@@ -353,7 +384,7 @@
       h('p', { class: 'muted small' }, `${D.fmtFecha(p.horario.fecha)} · ${horaRango(p.horario)} · ${p.localidad.nombre}`));
   }
 
-  function tabReservas(data, activo) {
+  function tabReservas(data) {
     const tarjeta = (p, propia) => h('article', { class: 'card' },
       h('div', { class: 'card__row' }, resumenPartida(p), badge(p.estado)),
       h('p', { class: 'small' }, `${p.cupos_ocupados}/${p.cupos_totales} cupos`, !propia && p.organizador ? ` · Organiza ${p.organizador.nombre}` : ''),
@@ -362,7 +393,7 @@
         h('a', { class: 'btn btn--small', href: linkCancha(p.cancha.id_cancha, p.horario.fecha, p.horario.id_horario) }, propia ? 'Ver y invitar' : 'Ver cancha'),
         propia && p.estado === 'ACTIVA' && h('button', {
           type: 'button', class: 'btn btn--small btn--danger',
-          onclick: () => { if (window.confirm('¿Cancelar esta reserva? Se liberará la franja y se cancelarán las solicitudes pendientes.')) accion(Svc.cancelarReserva(p.id_reserva, activo.id_jugador), 'Reserva cancelada.'); },
+          onclick: () => { if (window.confirm('¿Cancelar esta reserva? Se liberará la franja y se cancelarán las solicitudes pendientes.')) accion(Svc.cancelarReserva(p.id_reserva), 'Reserva cancelada.'); },
         }, 'Cancelar')));
 
     return h('div', null,
@@ -371,7 +402,7 @@
       data.jugando.length > 0 && [h('h2', null, 'Partidas en las que juego'), h('div', { class: 'grid' }, data.jugando.map((p) => tarjeta(p, false)))]);
   }
 
-  function filaSolicitud(s, activo, modo) {
+  function filaSolicitud(s, modo) {
     const p = s.reserva;
     const activa = s.estado === 'PENDIENTE' && p.estado === 'ACTIVA';
     let titulo_;
@@ -381,11 +412,11 @@
     const acciones = [];
     if (modo === 'recibida' && activa) {
       acciones.push(
-        h('button', { type: 'button', class: 'btn btn--small btn--primary', onclick: () => accion(Svc.responder(s.id_solicitud, activo.id_jugador, true), 'Solicitud aceptada.') }, 'Aceptar'),
-        h('button', { type: 'button', class: 'btn btn--small', onclick: () => accion(Svc.responder(s.id_solicitud, activo.id_jugador, false), 'Solicitud rechazada.') }, 'Rechazar'));
+        h('button', { type: 'button', class: 'btn btn--small btn--primary', onclick: () => accion(Svc.responder(s.id_solicitud, true), 'Solicitud aceptada.') }, 'Aceptar'),
+        h('button', { type: 'button', class: 'btn btn--small', onclick: () => accion(Svc.responder(s.id_solicitud, false), 'Solicitud rechazada.') }, 'Rechazar'));
     }
     if (modo === 'enviada' && activa) {
-      acciones.push(h('button', { type: 'button', class: 'btn btn--small', onclick: () => accion(Svc.cancelarSolicitud(s.id_solicitud, activo.id_jugador), 'Solicitud cancelada.') }, 'Cancelar'));
+      acciones.push(h('button', { type: 'button', class: 'btn btn--small', onclick: () => accion(Svc.cancelarSolicitud(s.id_solicitud), 'Solicitud cancelada.') }, 'Cancelar'));
     }
 
     return h('article', { class: 'card' },
@@ -394,50 +425,89 @@
       acciones.length > 0 && h('div', { class: 'card__actions' }, acciones));
   }
 
-  function tabResponder(data, activo) {
+  function tabResponder(data) {
     return data.porResponder.length
-      ? h('div', { class: 'grid' }, data.porResponder.map((s) => filaSolicitud(s, activo, 'recibida')))
+      ? h('div', { class: 'grid' }, data.porResponder.map((s) => filaSolicitud(s, 'recibida')))
       : vacio('No tienes nada por responder', 'Aquí verás las solicitudes a tus partidas y las invitaciones que recibas.');
   }
 
-  function tabEnviadas(data, activo) {
+  function tabEnviadas(data) {
     return data.enviadas.length
-      ? h('div', { class: 'grid' }, data.enviadas.map((s) => filaSolicitud(s, activo, 'enviada')))
+      ? h('div', { class: 'grid' }, data.enviadas.map((s) => filaSolicitud(s, 'enviada')))
       : vacio('Aún no has enviado solicitudes ni invitaciones', 'Pide unirte a una partida desde el inicio o invita jugadores desde una cancha que reservaste.', h('a', { class: 'btn btn--primary', href: '#/' }, 'Ver partidas abiertas'));
   }
 
-  /* ------------------------------------------------------------------ Perfil */
+  /* ------------------------------------------------- Perfil: ingreso / registro */
 
-  V.perfil = function (_, q) {
+  V.perfil = async function (_, q) {
+    const usuario = Svc.getUsuario();
     const activo = Svc.getActivo();
-    const nuevo = q.get('nuevo') === '1' || !activo;
-    const editando = nuevo ? null : activo;
 
-    const perfiles = Svc.jugadores().slice().sort((a, b) => Number(!!a.ejemplo) - Number(!!b.ejemplo) || a.nombre.localeCompare(b.nombre, 'es'));
+    if (!usuario) {
+      const registro = q.get('modo') === 'registro';
+      return titulo(h('section', { class: 'page auth' },
+        h('h1', null, registro ? 'Crear perfil de jugador' : 'Ingresar'),
+        registro
+          ? [
+              h('p', { class: 'muted' }, 'Crea tu cuenta para reservar canchas y unirte a partidas.'),
+              formPerfil(null, 'registro'),
+              h('p', null, '¿Ya tienes cuenta? ', h('a', { class: 'link', href: '#/perfil' }, 'Ingresa aquí')),
+            ]
+          : [
+              formLogin(),
+              h('p', null, '¿No tienes cuenta? ', h('a', { class: 'link', href: '#/perfil?modo=registro' }, 'Crea tu perfil')),
+            ]
+      ), registro ? 'Crear perfil' : 'Ingresar');
+    }
 
-    return titulo(h('section', { class: 'page' },
-      h('h1', null, editando ? 'Mi perfil' : 'Crear perfil de jugador'),
-      !activo && h('p', { class: 'muted' }, 'Crea tu perfil para reservar canchas y unirte a partidas. Tus datos se guardan solo en este navegador.'),
-      h('div', { class: 'two-col' },
-        h('div', null, formPerfil(editando)),
-        h('aside', null,
-          h('h2', null, 'Perfiles en este navegador'),
-          h('p', { class: 'muted small' }, 'Cambia de perfil para probar cómo ven la app el organizador y los jugadores.'),
-          h('ul', { class: 'list' }, perfiles.map((j) => {
-            const esActivo = activo && activo.id_jugador === j.id_jugador;
-            const loc = Svc.getLocalidad(j.id_localidad);
-            return h('li', { class: 'list__item' },
-              avatar(j.nombre),
-              h('div', { class: 'list__body' }, h('strong', null, j.nombre), h('span', { class: 'muted small' }, `${POSICION_LABEL[j.posicion_preferida]} · ${loc.nombre}${j.ejemplo ? ' · ejemplo' : ''}`)),
-              esActivo ? h('span', { class: 'badge badge--ok' }, 'Activo')
-                : h('button', { type: 'button', class: 'btn btn--small', onclick: () => { Svc.setActivo(j.id_jugador); toast(`Ahora actúas como ${j.nombre}.`); go('#/perfil'); refresh(); } }, 'Usar'));
-          })),
-          activo && !nuevo && h('a', { class: 'btn btn--block', href: '#/perfil?nuevo=1' }, '+ Crear otro perfil')))
-    ), 'Perfil');
+    if (!activo) {
+      return titulo(h('section', { class: 'page auth' },
+        h('h1', null, 'Completa tu perfil'),
+        h('p', { class: 'muted' }, 'Tu cuenta ya existe, pero falta tu perfil de jugador.'),
+        formPerfil(null, 'completar', usuario.email),
+        botonSalir()), 'Perfil');
+    }
+
+    const disp = await Svc.disponibilidadDe(activo.id_jugador);
+    return titulo(h('section', { class: 'page auth' },
+      h('h1', null, 'Mi perfil'),
+      formPerfil(activo, 'editar', activo.correo, disp),
+      botonSalir()), 'Perfil');
   };
 
-  function formPerfil(jug) {
-    const disp = jug ? Svc.disponibilidadDe(jug.id_jugador) : [];
+  function botonSalir() {
+    return h('button', {
+      type: 'button', class: 'btn btn--block',
+      onclick: async () => { await Svc.salir(); toast('Cerraste sesión.'); irA('#/'); },
+    }, 'Cerrar sesión');
+  }
+
+  function formLogin() {
+    const err = h('p', { class: 'error', id: 'e-login', role: 'alert' });
+    const btn = h('button', { type: 'submit', class: 'btn btn--primary' }, 'Ingresar');
+    const form = h('form', { class: 'form card', novalidate: true },
+      h('div', { class: 'field' }, h('label', { for: 'l-correo' }, 'Correo electrónico'),
+        h('input', { type: 'email', id: 'l-correo', name: 'correo', autocomplete: 'email', maxlength: 100 })),
+      h('div', { class: 'field' }, h('label', { for: 'l-clave' }, 'Contraseña'),
+        h('input', { type: 'password', id: 'l-clave', name: 'clave', autocomplete: 'current-password' })),
+      err,
+      h('div', { class: 'form__actions' }, btn));
+    form.addEventListener('submit', async (e) => {
+      e.preventDefault();
+      err.textContent = '';
+      const fd = new FormData(form);
+      btn.disabled = true;
+      const res = await Svc.ingresar(fd.get('correo'), fd.get('clave'));
+      btn.disabled = false;
+      if (res.ok) { toast('¡Bienvenido de nuevo!'); irA(Svc.getActivo() ? '#/' : '#/perfil'); }
+      else err.textContent = res.error;
+    });
+    return form;
+  }
+
+  /** modo: 'registro' (cuenta nueva), 'completar' (cuenta sin perfil) o 'editar'. */
+  function formPerfil(jug, modo, correo, disp) {
+    disp = disp || [];
     const loc = jug ? Svc.getLocalidad(jug.id_localidad) : null;
     const ciudadSel = loc ? loc.id_ciudad : '';
 
@@ -462,9 +532,16 @@
         h('p', { class: 'error', id: `e-dia_${n}` }));
     });
 
+    const btn = h('button', { type: 'submit', class: 'btn btn--primary' }, modo === 'editar' ? 'Guardar cambios' : modo === 'registro' ? 'Crear perfil' : 'Guardar perfil');
+
     const form = h('form', { class: 'form card', novalidate: true },
       campo('p-nombre', 'Nombre completo', h('input', { type: 'text', id: 'p-nombre', name: 'nombre', maxlength: 60, autocomplete: 'name', value: jug ? jug.nombre : '', 'aria-describedby': 'e-nombre' })),
-      campo('p-correo', 'Correo electrónico', h('input', { type: 'email', id: 'p-correo', name: 'correo', maxlength: 100, autocomplete: 'email', value: jug ? jug.correo : '', 'aria-describedby': 'e-correo' })),
+      modo === 'registro'
+        ? [
+            campo('p-correo', 'Correo electrónico', h('input', { type: 'email', id: 'p-correo', name: 'correo', maxlength: 100, autocomplete: 'email', 'aria-describedby': 'e-correo' })),
+            campo('p-clave', 'Contraseña', h('input', { type: 'password', id: 'p-clave', name: 'clave', autocomplete: 'new-password', 'aria-describedby': 'e-clave' }), 'Mínimo 6 caracteres.'),
+          ]
+        : campo('p-correo', 'Correo electrónico', h('input', { type: 'email', id: 'p-correo', name: 'correo', value: correo || '', readonly: true, 'aria-describedby': 'e-correo' }), 'El correo es el de tu cuenta y no se puede cambiar aquí.'),
       campo('p-tel', 'Celular (opcional)', h('input', { type: 'tel', id: 'p-tel', name: 'telefono', maxlength: 13, inputmode: 'numeric', autocomplete: 'tel', value: jug ? jug.telefono : '', 'aria-describedby': 'e-telefono' }), 'Permite que te contacten por WhatsApp. 10 dígitos, empieza por 3.'),
       campo('p-pos', 'Posición preferida', select({ id: 'p-pos', name: 'posicion', 'aria-describedby': 'e-posicion' }, [{ value: '', label: 'Selecciona…' }].concat(Svc.POSICIONES.map((p) => ({ value: p, label: POSICION_LABEL[p] }))), jug ? jug.posicion_preferida : '')),
       h('div', { class: 'row-2' },
@@ -476,16 +553,15 @@
         h('p', { class: 'hint' }, 'Marca los días que puedes jugar y la franja en que estás libre.'),
         dias,
         h('p', { class: 'error', id: 'e-disponibilidad' })),
-      h('div', { class: 'form__actions' },
-        h('button', { type: 'submit', class: 'btn btn--primary' }, jug ? 'Guardar cambios' : 'Crear perfil'),
-        jug && h('a', { class: 'btn', href: '#/' }, 'Volver al inicio')));
+      h('div', { class: 'form__actions' }, btn, modo === 'editar' && h('a', { class: 'btn', href: '#/' }, 'Volver al inicio')));
 
-    form.addEventListener('submit', (e) => {
+    form.addEventListener('submit', async (e) => {
       e.preventDefault();
       const fd = new FormData(form);
       const data = {
         nombre: fd.get('nombre'),
         correo: fd.get('correo'),
+        clave: fd.get('clave'),
         telefono: fd.get('telefono'),
         posicion: fd.get('posicion'),
         id_localidad: Number(fd.get('id_localidad')) || null,
@@ -493,12 +569,21 @@
           .filter((n) => fd.get(`dia_${n}`) === 'on')
           .map((n) => ({ dia_semana: n, hora_inicio: fd.get(`ini_${n}`), hora_fin: fd.get(`fin_${n}`) })),
       };
-      const res = jug ? Svc.actualizarJugador(jug.id_jugador, data) : Svc.crearJugador(data);
       limpiarErrores(form);
-      if (res.ok) {
-        toast(jug ? 'Perfil actualizado.' : '¡Perfil creado! Ya puedes reservar y unirte a partidas.');
-        go('#/perfil');
-        refresh();
+      btn.disabled = true;
+      let res;
+      if (modo === 'registro') res = await Svc.registrar(data);
+      else if (modo === 'completar') res = await Svc.completarPerfil(data);
+      else res = await Svc.actualizarJugador(data);
+      btn.disabled = false;
+
+      if (res.ok && res.confirmar) {
+        toast('Te enviamos un correo para confirmar tu cuenta. Confírmalo e ingresa para terminar.');
+        irA('#/perfil');
+      } else if (res.ok) {
+        toast(modo === 'editar' ? 'Perfil actualizado.' : '¡Perfil creado! Ya puedes reservar y unirte a partidas.');
+        if (modo === 'editar') refresh();
+        else irA('#/');
       } else if (res.errores) {
         mostrarErrores(form, res.errores);
       } else {
@@ -521,7 +606,7 @@
       const input = form.querySelector(`[name="${nombreInput || campo}"]`);
       if (input) { input.setAttribute('aria-invalid', 'true'); if (!primero) primero = input; }
     };
-    ['nombre', 'correo', 'telefono', 'posicion'].forEach((c) => { if (errores[c]) poner(c, errores[c]); });
+    ['nombre', 'correo', 'clave', 'telefono', 'posicion'].forEach((c) => { if (errores[c]) poner(c, errores[c]); });
     if (errores.id_localidad) poner('id_localidad', errores.id_localidad);
     if (errores.disponibilidad) poner('disponibilidad', errores.disponibilidad, 'dia_1');
     if (errores.dias) Object.keys(errores.dias).forEach((n) => poner(`dia_${n}`, errores.dias[n], `fin_${n}`));

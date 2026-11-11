@@ -1,10 +1,17 @@
-/* Capa de lógica: reglas de negocio de MatchField (RF-01 a RF-17, RN-01 a RN-07).
-   Solo habla con la capa de datos (MF.Store); no toca el DOM. */
+/* Capa de lógica de MatchField (RF-01 a RF-17).
+   Habla solo con la capa de datos (MF.Store) y no toca el DOM.
+   Las reglas RN-02 a RN-07 se aplican en el servidor (supabase/schema.sql); aquí solo se
+   valida lo necesario para dar mensajes claros y se arma la información para las vistas.
+
+   Convenciones:
+     - Consultas: devuelven los datos y LANZAN Error (mensaje en español) si fallan.
+     - Acciones: devuelven { ok: true, ... } o { ok: false, error } (el perfil: { ok: false, errores }). */
 (function (MF) {
   'use strict';
 
   const D = MF.Dates;
-  const Store = MF.Store;
+  const { run, must } = MF.Store;
+  const db = () => MF.Store.db;
 
   const POSICIONES = ['PORTERO', 'DEFENSA', 'MEDIOCAMPISTA', 'DELANTERO'];
   const TIPOS = {
@@ -15,156 +22,110 @@
   const DIAS_VISIBLES = 7;
 
   const fail = (error) => ({ ok: false, error });
-  const col = (name) => Store.get(name, []);
-  const save = (name, arr) => Store.set(name, arr);
-  const nextId = (arr, key) => arr.reduce((m, x) => Math.max(m, x[key]), 0) + 1;
   const limpiar = (s, max) => String(s == null ? '' : s).replace(/\s+/g, ' ').trim().slice(0, max || 120);
+  const hm = (t) => (t ? String(t).slice(0, 5) : t); // 'HH:MM:SS' → 'HH:MM'
+  const normHorario = (h) => Object.assign({}, h, { hora_inicio: hm(h.hora_inicio), hora_fin: hm(h.hora_fin) });
 
-  /** Guarda varias colecciones; si alguna falla (p. ej. cuota llena) restaura todas. */
-  function commit(changes) {
-    const prev = {};
-    Object.keys(changes).forEach((k) => (prev[k] = col(k)));
-    for (const k of Object.keys(changes)) {
-      if (!save(k, changes[k]).ok) {
-        Object.keys(prev).forEach((p) => save(p, prev[p]));
-        return false;
-      }
+  /* Catálogos (casi estáticos) y sesión, en memoria. */
+  const cache = { ciudades: [], localidades: [], canchas: [] };
+  const sesion = { user: null, jugador: null };
+
+  /* ----------------------------------------------------------------- Arranque */
+
+  async function init() {
+    if (!MF.Store.listo) throw new Error(MF.Store.errorInicio);
+    const [ci, lo, ca] = await Promise.all([
+      must(db().from('ciudades').select('*').order('id_ciudad')),
+      must(db().from('localidades').select('*').order('nombre')),
+      must(db().from('canchas').select('*').eq('activa', true).order('nombre')),
+    ]);
+    cache.ciudades = ci;
+    cache.localidades = lo;
+    cache.canchas = ca;
+    await run(db().rpc('generar_horarios')); // idempotente: asegura las franjas de los próximos 7 días
+    await cargarSesion();
+  }
+
+  /* --------------------------------------------------------------- Catálogos */
+
+  const ciudades = () => cache.ciudades;
+  const localidades = (idCiudad) => cache.localidades.filter((l) => !idCiudad || l.id_ciudad === idCiudad);
+  const getLocalidad = (id) => cache.localidades.find((l) => l.id_localidad === id) || null;
+  const getCiudad = (id) => cache.ciudades.find((c) => c.id_ciudad === id) || null;
+  const getCancha = (id) => cache.canchas.find((c) => c.id_cancha === id) || null;
+
+  /* ------------------------------------------------------------------ Sesión */
+
+  const getUsuario = () => sesion.user;
+  const getActivo = () => sesion.jugador;
+
+  async function leerJugador(id) {
+    const r = await run(db().from('jugadores').select('*').eq('id_jugador', id).maybeSingle());
+    return r.ok && r.data ? Object.assign({}, r.data, { correo: sesion.user ? sesion.user.email : '' }) : null;
+  }
+
+  async function cargarSesion() {
+    sesion.user = null;
+    sesion.jugador = null;
+    let res;
+    try {
+      res = await db().auth.getSession();
+    } catch (e) {
+      return;
     }
-    return true;
+    const s = res && res.data && res.data.session;
+    if (!s) return;
+    sesion.user = s.user;
+    let j = await leerJugador(s.user.id);
+    if (!j && (await crearPerfilPendiente())) j = await leerJugador(s.user.id);
+    sesion.jugador = j;
   }
 
-  /* ---------------------------------------------------------------- Inicio */
-
-  function generarHorarios(sembrarReservas) {
-    const canchas = col('canchas').filter((c) => c.activa);
-    let horarios = col('horarios');
-    const existentes = new Set(horarios.map((h) => `${h.id_cancha}|${h.fecha}|${h.hora_inicio}`));
-    let id = nextId(horarios, 'id_horario');
-    const nuevos = [];
-    const hoy = D.hoy();
-
-    for (let d = 0; d < DIAS_VISIBLES; d++) {
-      const fecha = D.addDias(hoy, d);
-      const finde = D.dow7(fecha) >= 6;
-      const desde = finde ? 8 : 17;
-      const hasta = finde ? 21 : 22;
-      canchas.forEach((c) => {
-        for (let hr = desde; hr < hasta; hr++) {
-          const inicio = D.hh(hr);
-          if (existentes.has(`${c.id_cancha}|${fecha}|${inicio}`)) continue;
-          nuevos.push({ id_horario: id++, id_cancha: c.id_cancha, fecha, hora_inicio: inicio, hora_fin: D.hh(hr + 1), estado: 'DISPONIBLE' });
-        }
-      });
-    }
-
-    // Limpieza: franjas de días anteriores a ayer que no tengan reserva.
-    const conReserva = new Set(col('reservas').map((r) => r.id_horario));
-    const ayer = D.addDias(hoy, -1);
-    horarios = horarios.filter((h) => h.fecha >= ayer || conReserva.has(h.id_horario)).concat(nuevos);
-
-    if (sembrarReservas) {
-      const jugadores = col('jugadores');
-      const reservas = [];
-      const solicitudes = [];
-      const limite = D.addDias(hoy, 2);
-      horarios.forEach((h) => {
-        if (h.fecha > limite || D.at(h.fecha, h.hora_inicio) <= new Date()) return;
-        if ((h.id_horario * 7) % 5 !== 0) return;
-        const cancha = canchas.find((c) => c.id_cancha === h.id_cancha);
-        const locales = jugadores.filter((j) => j.id_localidad === cancha.id_localidad);
-        if (locales.length < 2) return;
-        const org = locales[h.id_horario % locales.length];
-        const otros = locales.filter((j) => j.id_jugador !== org.id_jugador).slice(0, (h.id_horario % 3) + 1);
-        const idReserva = reservas.length + 1;
-        reservas.push({
-          id_reserva: idReserva,
-          id_horario: h.id_horario,
-          id_organizador: org.id_jugador,
-          cupos_totales: TIPOS[cancha.tipo_cancha].cupos,
-          cupos_ocupados: 1 + otros.length,
-          estado: 'ACTIVA',
-          fecha_creacion: new Date().toISOString(),
-          posicion_organizador: org.posicion_preferida,
-        });
-        otros.forEach((j) =>
-          solicitudes.push({
-            id_solicitud: solicitudes.length + 1,
-            id_reserva: idReserva,
-            id_jugador: j.id_jugador,
-            tipo: 'SOLICITUD',
-            estado: 'ACEPTADA',
-            mensaje: '',
-            fecha_creacion: new Date().toISOString(),
-          })
-        );
-        h.estado = 'RESERVADO';
-      });
-      save('reservas', reservas);
-      save('solicitudes', solicitudes);
-    }
-
-    save('horarios', horarios);
+  /** Si el registro no devolvió sesión (correo por confirmar), el perfil viaja en user_metadata y se crea al ingresar. */
+  async function crearPerfilPendiente() {
+    const meta = sesion.user && sesion.user.user_metadata && sesion.user.user_metadata.perfil;
+    if (!meta || Object.keys(validarPerfil(meta)).length) return false;
+    const r = await insertarPerfil(sesion.user.id, meta);
+    return r.ok;
   }
 
-  function cargarSemilla() {
-    const s = MF.SEED;
-    Store.clearAll();
-    save('ciudades', s.ciudades);
-    save('localidades', s.localidades);
-    save('jugadores', s.jugadores);
-    save('disponibilidades', s.disponibilidades);
-    save('canchas', s.canchas);
-    save('horarios', []);
-    save('reservas', []);
-    save('solicitudes', []);
-    generarHorarios(true);
-    Store.set('version', s.version);
+  async function ingresar(correo, clave) {
+    const email = limpiar(correo, 100).toLowerCase();
+    if (!email || !clave) return fail('Escribe tu correo y tu contraseña.');
+    const r = await run(db().auth.signInWithPassword({ email, password: clave }));
+    if (!r.ok) return r;
+    await cargarSesion();
+    return { ok: true, jugador: sesion.jugador };
   }
 
-  function init() {
-    if (Store.get('version', 0) !== MF.SEED.version || !col('canchas').length) {
-      cargarSemilla();
-    } else {
-      generarHorarios(false);
-    }
+  async function salir() {
+    await run(db().auth.signOut());
+    sesion.user = null;
+    sesion.jugador = null;
+    return { ok: true };
   }
 
-  function reset() {
-    cargarSemilla();
+  /* ---------------------------------------------------------------- Jugadores */
+
+  async function disponibilidadDe(idJugador) {
+    const rows = await must(db().from('disponibilidades').select('*').eq('id_jugador', idJugador).order('dia_semana'));
+    return rows.map((d) => Object.assign({}, d, { hora_inicio: hm(d.hora_inicio), hora_fin: hm(d.hora_fin) }));
   }
 
-  /* ------------------------------------------------------------- Catálogos */
-
-  const ciudades = () => col('ciudades');
-  const localidades = (idCiudad) => col('localidades').filter((l) => !idCiudad || l.id_ciudad === idCiudad);
-  const getLocalidad = (id) => col('localidades').find((l) => l.id_localidad === id) || null;
-  const getCiudad = (id) => col('ciudades').find((c) => c.id_ciudad === id) || null;
-
-  /* --------------------------------------------------------------- Jugadores */
-
-  const jugadores = () => col('jugadores');
-  const getJugador = (id) => col('jugadores').find((j) => j.id_jugador === id) || null;
-  const disponibilidadDe = (id) =>
-    col('disponibilidades').filter((d) => d.id_jugador === id).sort((a, b) => a.dia_semana - b.dia_semana);
-
-  function getActivo() {
-    const id = Store.get('sesion', null);
-    return id == null ? null : getJugador(id);
-  }
-  function setActivo(id) {
-    return Store.set('sesion', id).ok;
-  }
-
-  /** RF-02, RN-01: devuelve un objeto de errores por campo (vacío si todo es válido). */
-  function validarPerfil(data, idExcluir) {
+  /** RF-02: devuelve un objeto de errores por campo (vacío si todo es válido).
+      opts.conCuenta: además valida correo y contraseña (registro). */
+  function validarPerfil(data, opts) {
+    opts = opts || {};
     const e = {};
     const nombre = limpiar(data.nombre, 60);
     if (nombre.length < 2) e.nombre = 'Escribe tu nombre (mínimo 2 caracteres).';
 
-    const correo = limpiar(data.correo, 100).toLowerCase();
-    if (!correo) e.correo = 'El correo es obligatorio.';
-    else if (!/^[^\s@]+@[^\s@]+\.[^\s@]{2,}$/.test(correo)) e.correo = 'Escribe un correo válido, por ejemplo nombre@correo.com.';
-    else if (col('jugadores').some((j) => j.correo === correo && j.id_jugador !== idExcluir)) e.correo = 'Ya existe un perfil con este correo.';
+    if (opts.conCuenta) {
+      const correo = limpiar(data.correo, 100).toLowerCase();
+      if (!correo) e.correo = 'El correo es obligatorio.';
+      else if (!/^[^\s@]+@[^\s@]+\.[^\s@]{2,}$/.test(correo)) e.correo = 'Escribe un correo válido, por ejemplo nombre@correo.com.';
+      if (String(data.clave || '').length < 6) e.clave = 'La contraseña debe tener al menos 6 caracteres.';
+    }
 
     const tel = String(data.telefono || '').replace(/[\s-]/g, '');
     if (tel && !/^3\d{9}$/.test(tel)) e.telefono = 'Usa un celular colombiano de 10 dígitos que empiece por 3.';
@@ -183,57 +144,74 @@
     return e;
   }
 
-  function normalizarPerfil(data) {
-    return {
-      nombre: limpiar(data.nombre, 60),
-      correo: limpiar(data.correo, 100).toLowerCase(),
-      telefono: String(data.telefono || '').replace(/[\s-]/g, ''),
-      posicion_preferida: data.posicion,
-      id_localidad: data.id_localidad,
-    };
+  const normalizarPerfil = (data) => ({
+    nombre: limpiar(data.nombre, 60),
+    telefono: String(data.telefono || '').replace(/[\s-]/g, ''),
+    posicion_preferida: data.posicion,
+    id_localidad: data.id_localidad,
+  });
+
+  async function guardarDisponibilidad(idJugador, disp) {
+    const del = await run(db().from('disponibilidades').delete().eq('id_jugador', idJugador));
+    if (!del.ok) return del;
+    return run(
+      db().from('disponibilidades').insert(
+        disp.map((d) => ({ id_jugador: idJugador, dia_semana: d.dia_semana, hora_inicio: d.hora_inicio, hora_fin: d.hora_fin }))
+      )
+    );
   }
 
-  function guardarDisponibilidad(idJugador, disp) {
-    const resto = col('disponibilidades').filter((d) => d.id_jugador !== idJugador);
-    let id = nextId(col('disponibilidades'), 'id_disponibilidad');
-    const nuevas = disp.map((d) => ({
-      id_disponibilidad: id++,
-      id_jugador: idJugador,
-      dia_semana: d.dia_semana,
-      hora_inicio: d.hora_inicio,
-      hora_fin: d.hora_fin,
-    }));
-    return resto.concat(nuevas);
+  async function insertarPerfil(idJugador, data) {
+    const r = await run(db().from('jugadores').insert(Object.assign({ id_jugador: idJugador }, normalizarPerfil(data))));
+    if (!r.ok) return r;
+    return guardarDisponibilidad(idJugador, data.disponibilidad);
   }
 
-  /** RF-01 */
-  function crearJugador(data) {
-    const errores = validarPerfil(data, null);
+  /** RF-01, RN-01: crea la cuenta (correo único lo garantiza Supabase Auth) y el perfil. */
+  async function registrar(data) {
+    const errores = validarPerfil(data, { conCuenta: true });
     if (Object.keys(errores).length) return { ok: false, errores };
-    const todos = col('jugadores');
-    const jugador = Object.assign({ id_jugador: nextId(todos, 'id_jugador'), fecha_registro: new Date().toISOString() }, normalizarPerfil(data));
-    const ok = commit({ jugadores: todos.concat(jugador), disponibilidades: guardarDisponibilidad(jugador.id_jugador, data.disponibilidad) });
-    if (!ok) return fail('No se pudo guardar el perfil: el almacenamiento del navegador está lleno.');
-    setActivo(jugador.id_jugador);
-    return { ok: true, jugador };
+    const perfil = {
+      nombre: data.nombre, telefono: data.telefono, posicion: data.posicion,
+      id_localidad: data.id_localidad, disponibilidad: data.disponibilidad,
+    };
+    const r = await run(
+      db().auth.signUp({ email: limpiar(data.correo, 100).toLowerCase(), password: data.clave, options: { data: { perfil } } })
+    );
+    if (!r.ok) return /Ya existe un perfil/.test(r.error) ? { ok: false, errores: { correo: r.error } } : r;
+    if (!r.data.session) return { ok: true, confirmar: true }; // el proyecto exige confirmar el correo
+    await cargarSesion();
+    if (!sesion.jugador) return fail('Tu cuenta se creó, pero no se pudo guardar el perfil. Ingresa de nuevo e inténtalo otra vez.');
+    return { ok: true, jugador: sesion.jugador };
+  }
+
+  /** Para quien ya tiene cuenta pero aún no tiene perfil. */
+  async function completarPerfil(data) {
+    if (!sesion.user) return fail('Inicia sesión primero.');
+    const errores = validarPerfil(data);
+    if (Object.keys(errores).length) return { ok: false, errores };
+    const r = await insertarPerfil(sesion.user.id, data);
+    if (!r.ok) return r;
+    await cargarSesion();
+    return { ok: true, jugador: sesion.jugador };
   }
 
   /** RF-03 */
-  function actualizarJugador(id, data) {
-    const errores = validarPerfil(data, id);
+  async function actualizarJugador(data) {
+    const j = sesion.jugador;
+    if (!j) return fail('Inicia sesión para editar tu perfil.');
+    const errores = validarPerfil(data);
     if (Object.keys(errores).length) return { ok: false, errores };
-    const todos = col('jugadores');
-    const i = todos.findIndex((j) => j.id_jugador === id);
-    if (i < 0) return fail('El perfil ya no existe.');
-    todos[i] = Object.assign({}, todos[i], normalizarPerfil(data));
-    const ok = commit({ jugadores: todos, disponibilidades: guardarDisponibilidad(id, data.disponibilidad) });
-    if (!ok) return fail('No se pudo guardar el perfil: el almacenamiento del navegador está lleno.');
-    return { ok: true, jugador: todos[i] };
+    const r = await run(db().from('jugadores').update(normalizarPerfil(data)).eq('id_jugador', j.id_jugador));
+    if (!r.ok) return r;
+    const d = await guardarDisponibilidad(j.id_jugador, data.disponibilidad);
+    if (!d.ok) return d;
+    await cargarSesion();
+    return { ok: true, jugador: sesion.jugador };
   }
 
-  /* ---------------------------------------------------------------- Canchas */
+  /* ----------------------------------------------------------------- Canchas */
 
-  const getCancha = (id) => col('canchas').find((c) => c.id_cancha === id) || null;
   const fechasDisponibles = () => Array.from({ length: DIAS_VISIBLES }, (_, i) => D.addDias(D.hoy(), i));
 
   function estadoHorario(h) {
@@ -244,23 +222,26 @@
   }
 
   /** RF-05, RF-06 */
-  function buscarCanchas(f) {
+  async function buscarCanchas(f) {
     f = f || {};
-    const locs = col('localidades');
-    const horarios = col('horarios');
     const fechas = f.fecha ? [f.fecha] : fechasDisponibles();
-    let lista = col('canchas').filter((c) => c.activa);
+    let lista = cache.canchas.slice();
     if (f.id_localidad) lista = lista.filter((c) => c.id_localidad === f.id_localidad);
     else if (f.id_ciudad) {
-      const ids = locs.filter((l) => l.id_ciudad === f.id_ciudad).map((l) => l.id_localidad);
+      const ids = cache.localidades.filter((l) => l.id_ciudad === f.id_ciudad).map((l) => l.id_localidad);
       lista = lista.filter((c) => ids.includes(c.id_localidad));
     }
     if (f.tipo) lista = lista.filter((c) => c.tipo_cancha === f.tipo);
 
+    const rows = await must(db().from('horarios').select('id_horario,id_cancha,fecha,hora_inicio,hora_fin,estado').in('fecha', fechas).limit(2000));
+    const libres = {};
+    rows.map(normHorario).forEach((h) => {
+      if (estadoHorario(h) === 'DISPONIBLE') libres[h.id_cancha] = (libres[h.id_cancha] || 0) + 1;
+    });
+
     lista = lista.map((c) => {
-      const libres = horarios.filter((h) => h.id_cancha === c.id_cancha && fechas.includes(h.fecha) && estadoHorario(h) === 'DISPONIBLE').length;
-      const loc = locs.find((l) => l.id_localidad === c.id_localidad);
-      return Object.assign({}, c, { localidad: loc, ciudad: loc ? getCiudad(loc.id_ciudad) : null, libres });
+      const loc = getLocalidad(c.id_localidad);
+      return Object.assign({}, c, { localidad: loc, ciudad: loc ? getCiudad(loc.id_ciudad) : null, libres: libres[c.id_cancha] || 0 });
     });
     if (f.fecha) lista = lista.filter((c) => c.libres > 0);
 
@@ -271,118 +252,79 @@
   }
 
   /** RF-07: franjas de una cancha en una fecha, con su estado y reserva activa. */
-  function horariosDe(idCancha, fecha) {
-    return col('horarios')
-      .filter((h) => h.id_cancha === idCancha && h.fecha === fecha)
-      .sort((a, b) => a.hora_inicio.localeCompare(b.hora_inicio))
-      .map((h) => {
-        const r = reservaActivaDeHorario(h.id_horario);
-        return Object.assign({}, h, { estado: estadoHorario(h), reserva: r ? detalleReserva(r) : null });
-      });
+  async function horariosDe(idCancha, fecha) {
+    const hs = (await must(db().from('horarios').select('*').eq('id_cancha', idCancha).eq('fecha', fecha).order('hora_inicio'))).map(normHorario);
+    const ids = hs.filter((h) => h.estado === 'RESERVADO').map((h) => h.id_horario);
+    const reservas = ids.length ? await reservasDetalle((q) => q.in('id_horario', ids).eq('estado', 'ACTIVA')) : [];
+    return hs.map((h) => Object.assign({}, h, { estado: estadoHorario(h), reserva: reservas.find((r) => r.id_horario === h.id_horario) || null }));
   }
 
-  /* --------------------------------------------------------------- Reservas */
+  /* ---------------------------------------------------------------- Reservas */
 
-  const reservaActivaDeHorario = (idHorario) =>
-    col('reservas').find((r) => r.id_horario === idHorario && r.estado === 'ACTIVA') || null;
+  const RESERVA_SELECT =
+    '*, horario:horarios(*, cancha:canchas(*)), organizador:jugadores!id_organizador(*), solicitudes(*, jugador:jugadores(*))';
 
   function detalleReserva(r) {
-    if (typeof r === 'number') r = col('reservas').find((x) => x.id_reserva === r);
-    if (!r) return null;
-    const horario = col('horarios').find((h) => h.id_horario === r.id_horario) || null;
-    const cancha = horario ? getCancha(horario.id_cancha) : null;
-    const sols = col('solicitudes').filter((s) => s.id_reserva === r.id_reserva);
+    const horario = r.horario ? normHorario(r.horario) : null;
+    const cancha = horario ? horario.cancha || null : null;
+    const sols = r.solicitudes || [];
     const finalizada = r.estado === 'ACTIVA' && horario && D.at(horario.fecha, horario.hora_fin) <= new Date();
     return Object.assign({}, r, {
       estado: finalizada ? 'FINALIZADA' : r.estado,
       horario,
       cancha,
       localidad: cancha ? getLocalidad(cancha.id_localidad) : null,
-      organizador: getJugador(r.id_organizador),
-      participantes: sols.filter((s) => s.estado === 'ACEPTADA').map((s) => getJugador(s.id_jugador)).filter(Boolean),
+      organizador: r.organizador || null,
+      participantes: sols.filter((s) => s.estado === 'ACEPTADA').map((s) => s.jugador).filter(Boolean),
       solicitudes: sols,
       cuposLibres: r.cupos_totales - r.cupos_ocupados,
     });
   }
 
-  const cmpPartida = (a, b) =>
-    (a.horario.fecha + a.horario.hora_inicio).localeCompare(b.horario.fecha + b.horario.hora_inicio);
+  async function reservasDetalle(filtro) {
+    let q = db().from('reservas').select(RESERVA_SELECT);
+    if (filtro) q = filtro(q);
+    return (await must(q)).map(detalleReserva);
+  }
 
-  /** RF-15 */
-  function partidasAbiertas(f) {
+  const cmpPartida = (a, b) => (a.horario.fecha + a.horario.hora_inicio).localeCompare(b.horario.fecha + b.horario.hora_inicio);
+
+  /** RF-15 (las reservas solo las ve quien tiene sesión: RLS). */
+  async function partidasAbiertas(f) {
     f = f || {};
-    return col('reservas')
-      .filter((r) => r.estado === 'ACTIVA')
-      .map(detalleReserva)
-      .filter((p) => p && p.estado === 'ACTIVA' && p.cuposLibres > 0 && p.horario && p.cancha)
+    return (await reservasDetalle((q) => q.eq('estado', 'ACTIVA')))
+      .filter((p) => p.estado === 'ACTIVA' && p.cuposLibres > 0 && p.horario && p.cancha)
       .filter((p) => !f.id_localidad || p.cancha.id_localidad === f.id_localidad)
       .sort(cmpPartida)
       .slice(0, f.limit || 50);
   }
 
-  /** RF-08, RN-02, RN-03, RN-06 */
-  function reservar(p) {
-    const org = getJugador(p.id_organizador);
-    if (!org) return fail('Necesitas un perfil activo para reservar.');
-    const horarios = col('horarios');
-    const h = horarios.find((x) => x.id_horario === p.id_horario);
-    if (!h) return fail('La franja no existe.');
-    if (estadoHorario(h) !== 'DISPONIBLE') return fail('Esta franja ya no está disponible.');
-    if (reservaActivaDeHorario(h.id_horario)) return fail('Esta franja ya fue reservada.');
-    const cancha = getCancha(h.id_cancha);
-    const max = TIPOS[cancha.tipo_cancha].cupos;
-    const cupos = Number(p.cupos_totales);
-    if (!Number.isInteger(cupos) || cupos < 2 || cupos > max) return fail(`Los cupos deben estar entre 2 y ${max}.`);
-
-    const reservas = col('reservas');
-    const reserva = {
-      id_reserva: nextId(reservas, 'id_reserva'),
-      id_horario: h.id_horario,
-      id_organizador: org.id_jugador,
-      cupos_totales: cupos,
-      cupos_ocupados: 1,
-      estado: 'ACTIVA',
-      fecha_creacion: new Date().toISOString(),
-      posicion_organizador: POSICIONES.includes(p.posicion) ? p.posicion : org.posicion_preferida,
-    };
-    h.estado = 'RESERVADO';
-    if (!commit({ reservas: reservas.concat(reserva), horarios })) return fail('No se pudo guardar la reserva: el almacenamiento del navegador está lleno.');
-    return { ok: true, reserva: detalleReserva(reserva) };
+  /** RF-08. RN-02, RN-03 y RN-06 se validan en el servidor. El organizador es el usuario con sesión. */
+  async function reservar(p) {
+    const r = await run(db().rpc('reservar', { p_id_horario: p.id_horario, p_cupos: Number(p.cupos_totales), p_posicion: p.posicion || null }));
+    return r.ok ? { ok: true, id_reserva: r.data } : r;
   }
 
   /** RF-09 */
-  function cancelarReserva(idReserva, idActor) {
-    const reservas = col('reservas');
-    const r = reservas.find((x) => x.id_reserva === idReserva);
-    if (!r) return fail('La reserva no existe.');
-    if (r.id_organizador !== idActor) return fail('Solo el organizador puede cancelar la reserva.');
-    if (r.estado !== 'ACTIVA') return fail('La reserva ya no está activa.');
-    r.estado = 'CANCELADA';
-    const horarios = col('horarios');
-    const h = horarios.find((x) => x.id_horario === r.id_horario);
-    if (h) h.estado = 'DISPONIBLE';
-    const solicitudes = col('solicitudes');
-    solicitudes.forEach((s) => {
-      if (s.id_reserva === idReserva && s.estado === 'PENDIENTE') s.estado = 'CANCELADA';
-    });
-    if (!commit({ reservas, horarios, solicitudes })) return fail('No se pudo cancelar: el almacenamiento del navegador está lleno.');
-    return { ok: true };
-  }
+  const cancelarReserva = (idReserva) => run(db().rpc('cancelar_reserva', { p_id_reserva: idReserva }));
 
   /** RF-10, RN-07: misma localidad y disponibilidad que cubra la franja. */
-  function jugadoresDisponibles(idHorario) {
-    const h = col('horarios').find((x) => x.id_horario === idHorario);
-    if (!h) return [];
+  async function jugadoresDisponibles(h, reserva, idExcluir) {
     const cancha = getCancha(h.id_cancha);
+    if (!cancha) return [];
     const dow = D.dow7(h.fecha);
-    const disp = col('disponibilidades');
-    const reserva = reservaActivaDeHorario(idHorario);
-    return col('jugadores').filter(
-      (j) =>
-        j.id_localidad === cancha.id_localidad &&
-        (!reserva || j.id_jugador !== reserva.id_organizador) &&
-        disp.some((d) => d.id_jugador === j.id_jugador && d.dia_semana === dow && d.hora_inicio <= h.hora_inicio && d.hora_fin >= h.hora_fin)
-    );
+    const rows = await must(db().from('jugadores').select('*, disponibilidades(*)').eq('id_localidad', cancha.id_localidad));
+    return rows
+      .filter(
+        (j) =>
+          (!reserva || j.id_jugador !== reserva.id_organizador) &&
+          j.id_jugador !== idExcluir &&
+          j.disponibilidades.some((d) => d.dia_semana === dow && hm(d.hora_inicio) <= h.hora_inicio && hm(d.hora_fin) >= h.hora_fin)
+      )
+      .map((j) => {
+        const { disponibilidades, ...resto } = j;
+        return resto;
+      });
   }
 
   /** Relación de un jugador con una partida: organizador, solicitante o ninguna. */
@@ -393,82 +335,19 @@
     return s ? { rol: 'SOLICITANTE', solicitud: s } : null;
   }
 
-  /* ------------------------------------------------------------ Solicitudes */
+  /* ------------------------------------------------------------- Solicitudes */
 
-  function crearSolicitud(reserva, idJugador, tipo) {
-    const solicitudes = col('solicitudes');
-    if (solicitudes.some((s) => s.id_reserva === reserva.id_reserva && s.id_jugador === idJugador)) {
-      return fail('Ya existe una solicitud o invitación para esta partida.'); // RN-04
-    }
-    const s = {
-      id_solicitud: nextId(solicitudes, 'id_solicitud'),
-      id_reserva: reserva.id_reserva,
-      id_jugador: idJugador,
-      tipo,
-      estado: 'PENDIENTE',
-      mensaje: '',
-      fecha_creacion: new Date().toISOString(),
-    };
-    if (!commit({ solicitudes: solicitudes.concat(s) })) return fail('No se pudo guardar: el almacenamiento del navegador está lleno.');
-    return { ok: true, solicitud: s };
-  }
-
-  /** RF-13, RN-03, RN-04, RN-05 */
-  function solicitarUnirse(idReserva, idJugador) {
-    const r = detalleReserva(idReserva);
-    if (!r || r.estado !== 'ACTIVA') return fail('Esta partida ya no está activa.');
-    if (!getJugador(idJugador)) return fail('Necesitas un perfil activo para solicitar unirte.');
-    if (r.id_organizador === idJugador) return fail('No puedes solicitar unirte a tu propia reserva.');
-    if (r.cuposLibres <= 0) return fail('La partida no tiene cupos disponibles.');
-    return crearSolicitud(r, idJugador, 'SOLICITUD');
-  }
+  /** RF-13, RN-03, RN-04, RN-05 (en el servidor). */
+  const solicitarUnirse = (idReserva) => run(db().rpc('solicitar_unirse', { p_id_reserva: idReserva }));
 
   /** RF-12 */
-  function invitar(idReserva, idOrganizador, idJugador) {
-    const r = detalleReserva(idReserva);
-    if (!r || r.estado !== 'ACTIVA') return fail('Esta partida ya no está activa.');
-    if (r.id_organizador !== idOrganizador) return fail('Solo el organizador puede invitar jugadores.');
-    if (idJugador === idOrganizador) return fail('No puedes invitarte a ti mismo.');
-    if (r.cuposLibres <= 0) return fail('La partida no tiene cupos disponibles.');
-    return crearSolicitud(r, idJugador, 'INVITACION');
-  }
+  const invitar = (idReserva, idJugador) => run(db().rpc('invitar', { p_id_reserva: idReserva, p_id_jugador: idJugador }));
 
   /** RF-14, RN-03: aceptar/rechazar solicitudes (organizador) o invitaciones (invitado). */
-  function responder(idSolicitud, idActor, aceptar) {
-    const solicitudes = col('solicitudes');
-    const s = solicitudes.find((x) => x.id_solicitud === idSolicitud);
-    if (!s) return fail('La solicitud no existe.');
-    if (s.estado !== 'PENDIENTE') return fail('Esta solicitud ya fue respondida.');
-    const reservas = col('reservas');
-    const r = reservas.find((x) => x.id_reserva === s.id_reserva);
-    const det = r && detalleReserva(r);
-    if (!det || det.estado !== 'ACTIVA') return fail('La partida ya no está activa.');
-    const autorizado = s.tipo === 'SOLICITUD' ? r.id_organizador === idActor : s.id_jugador === idActor;
-    if (!autorizado) return fail('No tienes permiso para responder esta solicitud.');
-    if (aceptar) {
-      if (r.cupos_ocupados >= r.cupos_totales) return fail('No hay cupos disponibles: no se puede aceptar.');
-      r.cupos_ocupados += 1;
-      s.estado = 'ACEPTADA';
-    } else {
-      s.estado = 'RECHAZADA';
-    }
-    if (!commit({ solicitudes, reservas })) return fail('No se pudo guardar: el almacenamiento del navegador está lleno.');
-    return { ok: true };
-  }
+  const responder = (idSolicitud, aceptar) => run(db().rpc('responder_solicitud', { p_id_solicitud: idSolicitud, p_aceptar: !!aceptar }));
 
   /** Quien creó la solicitud puede retirarla mientras esté pendiente. */
-  function cancelarSolicitud(idSolicitud, idActor) {
-    const solicitudes = col('solicitudes');
-    const s = solicitudes.find((x) => x.id_solicitud === idSolicitud);
-    if (!s) return fail('La solicitud no existe.');
-    if (s.estado !== 'PENDIENTE') return fail('Solo se pueden cancelar solicitudes pendientes.');
-    const r = col('reservas').find((x) => x.id_reserva === s.id_reserva);
-    const creador = s.tipo === 'SOLICITUD' ? s.id_jugador : r && r.id_organizador;
-    if (creador !== idActor) return fail('No tienes permiso para cancelar esta solicitud.');
-    s.estado = 'CANCELADA';
-    if (!commit({ solicitudes })) return fail('No se pudo guardar: el almacenamiento del navegador está lleno.');
-    return { ok: true };
-  }
+  const cancelarSolicitud = (idSolicitud) => run(db().rpc('cancelar_solicitud', { p_id_solicitud: idSolicitud }));
 
   const cmpSolicitud = (a, b) => {
     const pa = a.estado === 'PENDIENTE' ? 0 : 1;
@@ -476,14 +355,11 @@
     return pa - pb || b.fecha_creacion.localeCompare(a.fecha_creacion);
   };
 
-  function enriquecerSolicitud(s) {
-    return Object.assign({}, s, { reserva: detalleReserva(s.id_reserva), jugador: getJugador(s.id_jugador) });
-  }
-
-  /** RF-16: todo lo que necesita el panel "Mis partidas". */
-  function misPartidas(idJugador) {
-    const reservas = col('reservas').map(detalleReserva).filter((r) => r && r.horario && r.cancha);
-    const solicitudes = col('solicitudes').map(enriquecerSolicitud).filter((s) => s.reserva && s.reserva.horario && s.reserva.cancha);
+  /** RF-16: todo lo que necesita el panel "Mis partidas" (una sola consulta; RLS limita lo visible). */
+  async function misPartidas(idJugador) {
+    const reservas = (await reservasDetalle()).filter((r) => r.horario && r.cancha);
+    const solicitudes = [];
+    reservas.forEach((r) => r.solicitudes.forEach((s) => solicitudes.push(Object.assign({}, s, { reserva: r }))));
 
     const mias = reservas.filter((r) => r.id_organizador === idJugador).sort((a, b) => -cmpPartida(a, b));
     const jugando = reservas
@@ -507,16 +383,15 @@
     };
   }
 
-  function pendientesDe(idJugador) {
-    return idJugador == null ? 0 : misPartidas(idJugador).pendientes;
+  async function pendientesDe(idJugador) {
+    return idJugador == null ? 0 : (await misPartidas(idJugador)).pendientes;
   }
 
   MF.Svc = {
     POSICIONES, TIPOS, DIAS_VISIBLES,
-    init, reset,
+    init,
     ciudades, localidades, getLocalidad, getCiudad,
-    jugadores, getJugador, disponibilidadDe, getActivo, setActivo,
-    validarPerfil, crearJugador, actualizarJugador,
+    getUsuario, getActivo, ingresar, salir, registrar, completarPerfil, actualizarJugador, validarPerfil, disponibilidadDe,
     getCancha, fechasDisponibles, buscarCanchas, horariosDe,
     detalleReserva, partidasAbiertas, reservar, cancelarReserva, jugadoresDisponibles, relacion,
     solicitarUnirse, invitar, responder, cancelarSolicitud, misPartidas, pendientesDe,

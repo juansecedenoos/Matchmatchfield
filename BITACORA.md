@@ -128,20 +128,38 @@ MatchField/
 
 ---
 
-## 7. Pendientes
+## 7. Segunda sesión (11/11/2026): push y backend con Supabase
 
-- [ ] Llevar la carpeta al otro equipo **incluyendo `.git`** y hacer `git push -u origin main` con la cuenta `juansecedenoos`.
-- [ ] Verificar el nombre del repositorio: la URL tiene "match" repetido (`Matchmatchfield`). Si es un error, usar `git remote set-url origin <URL correcta>`.
-- [ ] Decidir la publicación: repo público + GitHub Pages (*Settings → Pages → Source: GitHub Actions*), o repo privado + Vercel.
+### 7.1 Push a GitHub (resuelto)
+- Git no estaba instalado en el equipo: se instaló Git 2.56.0 con winget.
+- El push fallaba con `Repository not found` aunque la cuenta era la correcta. **Causa:** el repositorio se llama `Matchmatchfield.` (con un punto al final) y el remoto no lo tenía. Se corrigió con `git remote set-url origin https://github.com/juansecedenoos/Matchmatchfield..git`.
+- El login de GitHub necesita una ventana interactiva: se hizo desde el Terminal del app, no desde la herramienta PowerShell (que no admite prompts).
+- Resultado: `main` quedó publicado con los commits `4ae372d` y `d05fbec`.
+
+### 7.2 Migración a Supabase
+- Proyecto Supabase creado por el usuario (`zfovxfarmtvcjrnnollr`). Primer intento de ejecutar el SQL falló con `password authentication failed for user "postgres"`: el proyecto aún se estaba aprovisionando; se resolvió esperando y repitiendo.
+- Nuevo `supabase/schema.sql`: 8 tablas, RLS, índice único parcial para RN-02, restricción para RN-03, y funciones `security definer` (`reservar`, `cancelar_reserva`, `solicitar_unirse`, `invitar`, `responder_solicitud`, `cancelar_solicitud`, `generar_horarios`) que aplican RN-02 a RN-07 de forma atómica. Las reservas, solicitudes y franjas no admiten escritura directa.
+- Autenticación con Supabase Auth (correo y contraseña). RN-01 la garantiza Auth. `js/storage.js` pasó de LocalStorage al cliente de Supabase; `services.js`, `views.js` y `app.js` pasaron a `async/await`. Nueva pantalla de ingreso y registro; se eliminó el selector de perfiles y el botón "Restablecer datos de ejemplo". `data/seed.js` se eliminó (el catálogo vive en el SQL).
+- **Cambios de comportamiento:** ya no hay jugadores de ejemplo (necesitarían cuentas Auth); la app requiere internet y servirse por HTTP; las partidas abiertas solo las ve quien inicia sesión.
+- **Verificado:** el esquema responde con la clave anon (11 canchas, 561 franjas, RLS oculta las reservas a anónimos); la app carga, lista canchas, muestra franjas y pide ingresar en "Mis partidas", sin errores en consola.
+- **No verificado:** registro, ingreso, reservar, invitar, solicitar y responder con cuentas reales; las funciones SQL con varios usuarios; Firefox, Safari y celular.
+
+---
+
+## 8. Pendientes
+
+- [ ] Probar el flujo completo con dos o tres cuentas reales (ver README) y corregir lo que falle.
+- [ ] Confirmar en Supabase que *Confirm email* está desactivado (si no, el registro pide confirmar el correo).
+- [ ] Decidir la publicación: repo público + GitHub Pages (*Settings → Pages → Source: GitHub Actions*), o repo privado + Vercel. Al publicar, añadir la URL en *Authentication → URL Configuration*.
+- [ ] Renombrar el repositorio para quitar el punto final (opcional) y actualizar el remoto.
 - [ ] Probar la app en un celular real y en Firefox y Safari.
 - [ ] Corregir los documentos: portada de la propuesta, referencia de Bidelman, `UNIQUE(id_horario)` en el modelo relacional.
-- [ ] Migración a Supabase: diseñar tablas SQL, activar Row Level Security, reemplazar `storage.js`, pasar `services.js` a asíncrono y usar Supabase Auth.
 - [ ] Mantener fuera del repositorio cualquier clave `service_role` de Supabase. La clave `anon` es pública por diseño; la seguridad depende de RLS.
 
 ---
 
-## 8. Cómo retomar
+## 9. Cómo retomar
 
-1. Abrir la carpeta `MatchField/` y revisar `README.md` para ejecutar la app.
-2. Revisar `git log` (debe mostrar `4ae372d` con autor `juansecedenoos`) y `git status`.
-3. Continuar por el primer pendiente de la sección 7.
+1. Abrir la carpeta `MatchField/` y revisar `README.md` para ejecutar la app (`python -m http.server 8080`).
+2. Revisar `git log` y `git status`.
+3. Continuar por el primer pendiente de la sección 8.
