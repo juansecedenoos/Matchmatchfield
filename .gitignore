@@ -6,3 +6,6 @@ node_modules/
 Thumbs.db
 .vscode/
 .idea/
+
+# Claude Code: configuración local de cada persona
+.claude/settings.local.json
