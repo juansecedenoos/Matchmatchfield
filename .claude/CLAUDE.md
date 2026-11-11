@@ -46,7 +46,7 @@ RN-01 correo único · RN-02 una sola reserva **activa** por franja · RN-03 cup
 
 ## Git
 
-- Remoto: `https://github.com/juansecedenoos/Matchmatchfield..git` (privado). **El nombre del repo termina en un punto** (`Matchmatchfield.`); sin él GitHub responde `Repository not found`. Git está en `C:\Program Files\Git\cmd\git.exe` (puede no estar en el PATH de la sesión). El push necesita login interactivo: hacerlo desde el Terminal del app (`run_in_terminal`), no desde la herramienta PowerShell.
+- Remoto: `https://github.com/juansecedenoos/Matchmatchfield.git` (público; antes terminaba en punto: `Matchmatchfield.`). Sitio publicado: `https://juansecedenoos.github.io/Matchmatchfield/` (GitHub Pages con Actions). Git está en `C:\Program Files\Git\cmd\git.exe` (puede no estar en el PATH de la sesión). El push necesita login interactivo: hacerlo desde el Terminal del app (`run_in_terminal`), no desde la herramienta PowerShell.
 - Identidad **solo local** a este repositorio: `juansecedenoos` / correo de la universidad. No usar el correo global ni cuentas laborales.
 - Si el push responde `Repository not found`, casi seguro Git Credential Manager está usando otra cuenta guardada.
 - No hacer `push`, ni cambiar visibilidad, ni tocar credenciales sin confirmación del usuario.
